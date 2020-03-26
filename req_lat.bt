@@ -25,22 +25,20 @@ kprobe:blk_mq_complete_request
 / @mq_start_req[(struct request*)arg0] /
 {
  $req = (struct request*)arg0;
+ $len = $req->__data_len;
  $sec = $req->__sector;
 
  $elapsed_ns = nsecs - @mq_start_req[$req];
  $elapsed_us = $elapsed_ns / 1000;
  $elapsed_ms = $elapsed_us / 1000;
- @mq_time_millisecs = lhist( $elapsed_ms, 0, 30, 2 );
- @mq_assoc[$req->__data_len, $sec % 8] = stats($elapsed_ms);
+ @mq_time_microsecs = lhist( $elapsed_us, 0, 10000, 500 );
+ @mq_microtime_stats[$len] = stats($elapsed_us);
 
- @mq_sectors = hist($req->__sector);
  @mq_start_req[$req] = 0;
 
- printf("sec: %u, size: %u, segs: %u", $sec, $req->__data_len, $req->nr_phys_segments);
+ printf("sec: %u, size: %u, segs: %u", $sec, $len, $req->nr_phys_segments);
  printf(", time:%u.%u[ms]", $elapsed_us / 1000, $elapsed_us % 1000);
  printf("\n");
-
- @mq_start_req[$req] = 0;
 }
 
 END
