@@ -1,0 +1,275 @@
+#!/usr/local/bin/bpftrace
+
+#include <linux/fs.h>
+#include <linux/uio.h>
+#include <linux/bio.h>
+#include <linux/genhd.h>
+#include <linux/blkdev.h>
+#include <scsi/scsi_device.h>
+#include <scsi/scsi_cmnd.h>
+#include <linux/libata.h>
+#include <linux/device.h>
+#include <linux/buffer_head.h>
+#include <linux/huge_mm.h>
+#include <linux/fs.h>
+#include <linux/iomap.h>
+
+struct iomap_dio {
+	struct kiocb		*iocb;
+	iomap_dio_end_io_t	*end_io;
+	loff_t			i_size;
+	loff_t			size;
+	atomic_t		ref;
+	unsigned		flags;
+};
+
+kprobe:iomap_apply
+/ @vfs_write_start[tid] /
+{
+ @iomap_apply_start[tid] = nsecs;
+ unroll(3) { printf("."); }
+ printf("iomap_apply (pos = %lld, length = %lld) {\n", arg1, arg2);
+}
+kretprobe:iomap_apply
+/ @iomap_apply_start[tid] /
+{
+ $elapsed_us = (nsecs - @iomap_apply_start[tid]) / 1000;
+ unroll(3) { printf("."); }
+ printf(" %u.%u[ms]\n", $elapsed_us / 1000, $elapsed_us % 1000);
+
+ unroll(3) { printf("."); }
+ printf("}\n");
+ 
+ @iomap_apply_start[tid] = 0;
+}
+
+kprobe:iomap_dio_bio_actor
+/ @vfs_write_start[tid] /
+{
+ @iomap_dio_bio_actor[tid] = nsecs;
+ unroll(4) { printf("."); }
+ $inode = (struct inode*)arg0;
+ $dio = (struct iomap_dio*)arg3;
+ printf("iomap_dio_bio_actor");
+ printf("(inode->i_size = %lld, pos = %lld", $inode->i_size, arg1);
+ printf(", length = %lld, dio->flags | DIO_WRITE = %u) {\n", arg2, ($dio->flags & (1 << 30)) != 0);
+ // IOMAP_DIO_WRITE = 1 << 30, see https://elixir.bootlin.com/linux/v5.0/source/fs/iomap.c#L1437
+}
+kretprobe:iomap_dio_bio_actor
+/ @iomap_dio_bio_actor[tid] /
+{
+ $elapsed_us = (nsecs - @iomap_dio_bio_actor[tid]) / 1000;
+ unroll(4) { printf("."); }
+ printf(" %u.%u[ms]\n", $elapsed_us / 1000, $elapsed_us % 1000);
+
+ unroll(4) { printf("."); }
+ printf("}\n");
+
+ @iomap_dio_bio_actor[tid] = 0;
+} 
+
+kprobe:vfs_write
+/ str(((struct file*)arg0)->f_path.dentry->d_name.name) == "bench" /
+{
+ @vfs_write_start[tid] = nsecs;
+ printf("\nvfs_write {\n");
+}
+kretprobe:vfs_write
+/ @vfs_write_start[tid] /
+{
+ $elapsed_us = (nsecs - @vfs_write_start[tid]) / 1000;
+
+ printf(" %u.%u[ms]\n", $elapsed_us / 1000, $elapsed_us % 1000);
+ printf("}\n");
+ 
+ @vfs_write_start[tid] = 0;
+}
+
+kprobe:new_sync_write
+/ @vfs_write_start[tid] /
+{
+ @new_sync_write_start[tid] = nsecs;
+ unroll(1) { printf("."); }
+ printf("new_sync_write {\n");
+}
+kretprobe:new_sync_write
+/ @new_sync_write_start[tid] /
+{
+ $elapsed_us = (nsecs - @new_sync_write_start[tid]) / 1000;
+
+ unroll(1) { printf("."); }
+ printf(" %u.%u[ms]\n", $elapsed_us / 1000, $elapsed_us % 1000);
+
+ unroll(1) { printf("."); }
+ printf("}\n"); 
+
+ @new_sync_write_start[tid] = 0;
+} 
+
+kprobe:blk_start_plug
+/ @vfs_write_start[tid] /
+{
+ @blk_start_plug_start[tid] = nsecs;
+ $elapsed2 = nsecs - @vfs_write_start[tid];
+ unroll(3) { printf("."); }
+ printf("blk_start_plug {\n");
+}
+kretprobe:blk_start_plug
+/ @blk_start_plug_start[tid] /
+{
+ $elapsed_us = (nsecs - @blk_start_plug_start[tid]) / 1000;
+
+ unroll(3) { printf("."); }
+ printf(" %u.%u[ms]\n", $elapsed_us / 1000, $elapsed_us % 1000);
+ unroll(3) { printf("."); }
+ printf("}\n"); 
+
+ @blk_start_plug_start[tid] = 0;
+} 
+
+kprobe:blk_finish_plug
+/ @vfs_write_start[tid] /
+{
+ @blk_finish_plug_start[tid] = nsecs;
+
+ unroll(3) { printf("."); }
+ printf("blk_finish_plug { \n");
+}
+kretprobe:blk_finish_plug
+/ @blk_finish_plug_start[tid] /
+{
+ $elapsed_us = (nsecs - @blk_finish_plug_start[tid]) / 1000;
+
+ unroll(3) { printf("."); }
+ printf(" %u.%u[ms] \n", $elapsed_us / 1000, $elapsed_us % 1000);
+ unroll(3) { printf("."); }
+ printf("} ");
+
+ $elapsed_us = (nsecs - @iomap_dio_rw_start[tid]) / 1000;
+ printf(" <%u.%u[ms] since iomap_dio_rw>\n", $elapsed_us / 1000, $elapsed_us % 1000);
+
+ @blk_finish_plug_start[tid] = 0;
+} 
+
+kprobe:__blockdev_direct_IO
+/ @vfs_write_start[tid] /
+{
+ $iocb = (struct kiocb*)arg0;
+ @__blockdev_direct_IO_start[tid] = nsecs;
+ unroll(2) { printf("."); }
+ printf("__blockdev_direct_IO <sync=%d> {\n", $iocb->ki_complete == 0);
+}
+kretprobe:__blockdev_direct_IO
+/ @__blockdev_direct_IO_start[tid] /
+{
+ $elapsed_us = (nsecs - @__blockdev_direct_IO_start[tid]) / 1000;
+ unroll(2) { printf(".") }
+ printf(" %u.%u[ms]\n", $elapsed_us / 1000, $elapsed_us % 1000);
+ unroll(2) { printf(".") }
+ printf("}\n");
+} 
+
+kprobe:iomap_dio_complete
+/ @iomap_dio_rw_start[tid] /
+{
+ @iomap_dio_complete_start[tid] = nsecs;
+ $elapsed_us = (nsecs - @iomap_dio_rw_start[tid]) / 1000;
+
+ unroll(3) { printf("."); }
+ printf("iomap_dio_complete {");
+ printf(" <%u.%u[ms] since iomap_dio_rw>\n", $elapsed_us / 1000, $elapsed_us % 1000);
+}
+kretprobe:iomap_dio_complete
+/ @iomap_dio_complete_start[tid] /
+{
+ $elapsed_us = (nsecs - @iomap_dio_complete_start[tid]) / 1000;
+
+ unroll(3) { printf("."); }
+ printf(" %u.%u[ms]\n", $elapsed_us / 1000, $elapsed_us % 1000);
+
+ unroll(3) { printf("."); }
+ printf("}\n");
+
+ @iomap_dio_complete_start[tid] = 0;
+} 
+
+kprobe:iomap_dio_rw
+/ @new_sync_write_start[tid] /
+{
+ @iomap_dio_rw_start[tid] = nsecs;
+ $iocb = (struct kiocb*)arg0;
+ unroll(2) { printf("."); }
+ printf("iomap_dio_rw (sync=%d) {\n", $iocb->ki_complete == 0);
+} 
+kretprobe:iomap_dio_rw
+/ @iomap_dio_rw_start[tid] /
+{
+ $elapsed_us = (nsecs - @iomap_dio_rw_start[tid]) / 1000;
+
+ unroll(2) { printf("."); }
+ printf(" %u.%u[ms]\n", $elapsed_us / 1000, $elapsed_us % 1000);
+ 
+ unroll(2) { printf("."); }
+ printf("}\n"); 
+
+ @iomap_dio_rw_start[tid] = 0;
+}
+
+/*
+ * 注意:
+ * generic_make_request -> blk_mq_make_request -> blk_queue_split -> generic_make_request
+ * という再帰パターンがあるので、nesting levelは「本当は」一意ではない。
+ * この実装は手抜き
+ */
+kprobe:generic_make_request
+/ @vfs_write_start[tid] != 0 && ((struct bio*)arg0)->bi_disk->disk_name == "sdb"/
+{
+ $bio = (struct bio*)arg0;
+ @generic_make_request_start[tid] = nsecs;
+ unroll(5) { printf("."); } 
+ printf("generic_make_request (bio.iter_size = %lu) {\n", $bio->bi_iter.bi_size);
+ printf("callstack %s\n", kstack(3));
+}
+kretprobe:generic_make_request
+/ @generic_make_request_start[tid] /
+{
+ $elapsed_us = (nsecs - @generic_make_request_start[tid]) / 1000;
+
+ unroll(5) { printf("."); }
+ printf(" %u.%u[ms]\n", $elapsed_us / 1000, $elapsed_us % 1000);
+
+ unroll(5) { printf("."); }
+ printf("}\n");
+ @generic_make_request_start[tid] = 0;
+}
+
+kprobe:iomap_dio_zero
+/ @vfs_write_start[tid] /
+{
+ @iomap_dio_zero[tid] = nsecs;
+ unroll(5) { printf("."); }
+ printf("iomap_dio_zero (pos = %lld) {\n", arg2);
+}
+kretprobe:iomap_dio_zero
+/ @iomap_dio_zero[tid] /
+{
+ $elapsed_us = (nsecs - @iomap_dio_zero[tid]) / 1000;
+
+ unroll(5) { printf("."); }
+ printf(" %u.%u[ms]\n", $elapsed_us / 1000, $elapsed_us % 1000);
+
+ unroll(5) { printf("."); }
+ printf("}\n");
+ @iomap_dio_zero[tid] = 0;
+}
+
+END
+{
+ clear(@blk_finish_plug_start);
+ clear(@blk_start_plug_start);
+ clear(@iomap_dio_complete_start);
+ clear(@iomap_dio_rw_start);
+ clear(@new_sync_write_start);
+ clear(@generic_make_request_start);
+ clear(@vfs_write_start);
+}
