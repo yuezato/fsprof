@@ -248,7 +248,7 @@ kprobe:iomap_dio_zero
 {
  @iomap_dio_zero[tid] = nsecs;
  unroll(5) { printf("."); }
- printf("iomap_dio_zero (pos = %lld) {\n", arg2);
+ printf("iomap_dio_zero (pos = %lld) {\n", arg3);
 }
 kretprobe:iomap_dio_zero
 / @iomap_dio_zero[tid] /
